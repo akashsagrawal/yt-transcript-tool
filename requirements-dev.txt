@@ -1,0 +1,6 @@
+# Development-only dependencies. Render does NOT install these -- it only
+# reads requirements.txt. Install locally with:
+#   pip install -r requirements.txt -r requirements-dev.txt
+-r requirements.txt
+pytest==8.3.3
+httpx==0.27.2
