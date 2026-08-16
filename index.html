@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Transcript Puller</title>
+<style>
+  :root {
+    --paper: #171614;
+    --paper-raised: #201f1c;
+    --ink: #e8e3d8;
+    --ink-dim: #948e80;
+    --tape-amber: #e8a13d;
+    --rule: #35332e;
+    --error: #d9695f;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: var(--paper);
+    background-image:
+      repeating-linear-gradient(0deg, rgba(255,255,255,0.015) 0px, rgba(255,255,255,0.015) 1px, transparent 1px, transparent 3px);
+    color: var(--ink);
+    font-family: 'Courier New', 'IBM Plex Mono', monospace;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 48px 20px 80px;
+  }
+
+  .masthead {
+    width: 100%;
+    max-width: 720px;
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 20px;
+    margin-bottom: 36px;
+  }
+
+  .masthead .eyebrow {
+    font-size: 12px;
+    letter-spacing: 0.18em;
+    color: var(--tape-amber);
+    text-transform: uppercase;
+  }
+
+  .masthead h1 {
+    font-family: Georgia, 'Times New Roman', serif;
+    font-weight: 400;
+    font-size: 40px;
+    letter-spacing: -0.01em;
+    margin: 6px 0 8px;
+    color: var(--ink);
+  }
+
+  .masthead p {
+    color: var(--ink-dim);
+    font-size: 14px;
+    margin: 0;
+    line-height: 1.5;
+  }
+
+  .console {
+    width: 100%;
+    max-width: 720px;
+    background: var(--paper-raised);
+    border: 1px solid var(--rule);
+    padding: 28px;
+  }
+
+  .field-label {
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+    display: block;
+    margin-bottom: 8px;
+  }
+
+  .url-row {
+    display: flex;
+    gap: 10px;
+  }
+
+  input[type="text"] {
+    flex: 1;
+    background: var(--paper);
+    border: 1px solid var(--rule);
+    color: var(--ink);
+    padding: 12px 14px;
+    font-family: inherit;
+    font-size: 14px;
+  }
+
+  input[type="text"]:focus {
+    outline: none;
+    border-color: var(--tape-amber);
+  }
+
+  .options-row {
+    display: flex;
+    gap: 24px;
+    margin: 18px 0;
+    flex-wrap: wrap;
+  }
+
+  .radio-group {
+    display: flex;
+    gap: 14px;
+    align-items: center;
+  }
+
+  .radio-group label {
+    font-size: 13px;
+    color: var(--ink-dim);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+  }
+
+  .radio-group input { accent-color: var(--tape-amber); }
+
+  button {
+    background: var(--tape-amber);
+    color: #171614;
+    border: none;
+    padding: 12px 20px;
+    font-family: inherit;
+    font-weight: bold;
+    letter-spacing: 0.03em;
+    cursor: pointer;
+    font-size: 13px;
+    text-transform: uppercase;
+  }
+
+  button:hover { background: #f2b158; }
+  button:disabled { background: var(--rule); color: var(--ink-dim); cursor: not-allowed; }
+
+  .status {
+    margin-top: 16px;
+    font-size: 13px;
+    min-height: 18px;
+  }
+
+  .status.error { color: var(--error); }
+  .status.ok { color: #8fae7a; }
+
+  .reel {
+    margin-top: 20px;
+    max-height: 340px;
+    overflow-y: auto;
+    background: var(--paper);
+    border: 1px solid var(--rule);
+    padding: 16px;
+    font-size: 13px;
+    line-height: 1.7;
+    color: var(--ink);
+    white-space: pre-wrap;
+    display: none;
+  }
+
+  .actions {
+    margin-top: 16px;
+    display: none;
+    gap: 10px;
+  }
+
+  .actions button.secondary {
+    background: transparent;
+    color: var(--tape-amber);
+    border: 1px solid var(--tape-amber);
+  }
+
+  .actions button.secondary:hover { background: rgba(232,161,61,0.1); }
+
+  .counter {
+    font-size: 11px;
+    color: var(--ink-dim);
+    margin-top: 24px;
+    letter-spacing: 0.05em;
+  }
+
+  ::-webkit-scrollbar { width: 8px; }
+  ::-webkit-scrollbar-track { background: var(--paper); }
+  ::-webkit-scrollbar-thumb { background: var(--rule); }
+</style>
+</head>
+<body>
+
+  <div class="masthead">
+    <div class="eyebrow">Reel &rarr; Text</div>
+    <h1>Transcript Puller</h1>
+    <p>Paste any YouTube link. Pull the caption track straight off it as plain text or subtitle file — no sign-in, no per-use limit.</p>
+  </div>
+
+  <div class="console">
+    <label class="field-label" for="url">YouTube URL or video ID</label>
+    <div class="url-row">
+      <input type="text" id="url" placeholder="https://www.youtube.com/watch?v=..." />
+      <button id="go">Pull it</button>
+    </div>
+
+    <div class="options-row">
+      <div class="radio-group">
+        <span class="field-label" style="margin:0;">Format</span>
+        <label><input type="radio" name="fmt" value="txt" checked> Plain text</label>
+        <label><input type="radio" name="fmt" value="srt"> SRT (timed)</label>
+      </div>
+    </div>
+
+    <div id="status" class="status"></div>
+    <div id="reel" class="reel"></div>
+    <div id="actions" class="actions">
+      <button id="download">Download file</button>
+      <button id="copy" class="secondary">Copy to clipboard</button>
+    </div>
+  </div>
+
+  <div class="counter" id="counter">0 transcripts pulled this session</div>
+
+<script>
+  const urlInput = document.getElementById('url');
+  const goBtn = document.getElementById('go');
+  const statusEl = document.getElementById('status');
+  const reelEl = document.getElementById('reel');
+  const actionsEl = document.getElementById('actions');
+  const downloadBtn = document.getElementById('download');
+  const copyBtn = document.getElementById('copy');
+  const counterEl = document.getElementById('counter');
+
+  let lastBlobUrl = null;
+  let lastFilename = null;
+  let lastText = '';
+  let sessionCount = 0;
+
+  function setStatus(msg, kind) {
+    statusEl.textContent = msg;
+    statusEl.className = 'status' + (kind ? ' ' + kind : '');
+  }
+
+  async function pull() {
+    const url = urlInput.value.trim();
+    if (!url) { setStatus('Paste a YouTube URL or video ID first.', 'error'); return; }
+    const fmt = document.querySelector('input[name="fmt"]:checked').value;
+
+    goBtn.disabled = true;
+    reelEl.style.display = 'none';
+    actionsEl.style.display = 'none';
+    setStatus('Pulling transcript…');
+
+    try {
+      const resp = await fetch(`/api/transcript?url=${encodeURIComponent(url)}&fmt=${fmt}`);
+      if (!resp.ok) {
+        const body = await resp.json().catch(() => ({}));
+        throw new Error(body.detail || `Request failed (${resp.status})`);
+      }
+      const text = await resp.text();
+      const disposition = resp.headers.get('Content-Disposition') || '';
+      const match = disposition.match(/filename="(.+)"/);
+      lastFilename = match ? match[1] : `transcript.${fmt}`;
+      lastText = text;
+
+      if (lastBlobUrl) URL.revokeObjectURL(lastBlobUrl);
+      const blob = new Blob([text], { type: 'text/plain' });
+      lastBlobUrl = URL.createObjectURL(blob);
+
+      reelEl.textContent = text;
+      reelEl.style.display = 'block';
+      actionsEl.style.display = 'flex';
+      setStatus('Done. Preview below, or download / copy.', 'ok');
+
+      sessionCount++;
+      counterEl.textContent = `${sessionCount} transcript${sessionCount === 1 ? '' : 's'} pulled this session`;
+    } catch (err) {
+      setStatus(err.message || 'Something went wrong.', 'error');
+    } finally {
+      goBtn.disabled = false;
+    }
+  }
+
+  downloadBtn.addEventListener('click', () => {
+    if (!lastBlobUrl) return;
+    const a = document.createElement('a');
+    a.href = lastBlobUrl;
+    a.download = lastFilename || 'transcript.txt';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  });
+
+  copyBtn.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(lastText);
+      copyBtn.textContent = 'Copied';
+      setTimeout(() => (copyBtn.textContent = 'Copy to clipboard'), 1500);
+    } catch {
+      setStatus('Could not copy — select the text manually.', 'error');
+    }
+  });
+
+  goBtn.addEventListener('click', pull);
+  urlInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') pull(); });
+</script>
+</body>
+</html>
