@@ -26,10 +26,13 @@ import os
 import re
 import threading
 import time
+import uuid
 import zipfile
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO, StringIO
+
+import requests
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -79,6 +82,18 @@ RATE_LIMIT_WINDOW_SECONDS = _env_int("RATE_LIMIT_WINDOW_SECONDS", 60)
 # the proxy with 20 parallel requests is exactly how you get blocked.
 BULK_MAX_URLS = _env_int("BULK_MAX_URLS", 25)
 BULK_CONCURRENCY = max(1, _env_int("BULK_CONCURRENCY", 4))
+
+# Channel mode. Listing a channel's videos uses the official YouTube Data API
+# (free, 10,000 units/day; listing 1,000 videos costs about 21 units).
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "").strip()
+YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
+
+# A whole-channel run is a background job, because 1,000 videos cannot finish
+# inside one HTTP request. Only one job runs at a time -- the bottleneck is the
+# proxy, so a second parallel job would just slow the first one down.
+JOB_MAX_VIDEOS = _env_int("JOB_MAX_VIDEOS", 2000)
+JOB_RETENTION_SECONDS = _env_int("JOB_RETENTION_SECONDS", 6 * 60 * 60)
+JOB_MAX_KEPT = _env_int("JOB_MAX_KEPT", 10)
 
 # Comma-separated list, or "*" for any origin.
 ALLOWED_ORIGINS = [
@@ -381,6 +396,10 @@ def health():
             "window_seconds": RATE_LIMIT_WINDOW_SECONDS,
         },
         "bulk": {"max_urls": BULK_MAX_URLS, "concurrency": BULK_CONCURRENCY},
+        "channel_mode": {
+            "youtube_api_key_set": bool(YOUTUBE_API_KEY),
+            "max_videos_per_job": JOB_MAX_VIDEOS,
+        },
         "transcript_cache": transcript_cache.stats(),
         "language_cache": language_cache.stats(),
     }
@@ -466,7 +485,7 @@ def parse_url_list(raw: list[str]) -> list[str]:
 def fetch_one_for_bulk(index: int, raw_url: str, fmt: str, lang: str | None) -> dict:
     """Never raises -- a failure for one video must not sink the whole job."""
     result = {"index": index, "input": raw_url, "video_id": None, "ok": False,
-              "content": "", "error": ""}
+              "content": "", "error": "", "title": ""}
     try:
         video_id = extract_video_id(raw_url)
         result["video_id"] = video_id
@@ -495,14 +514,16 @@ def build_report(results: list[dict]) -> str:
         lines.append("FAILURES")
         lines.append("-" * 60)
         for r in failed:
-            lines.append(f"[{r['index']:02d}] {r['input']}")
-            lines.append(f"     {r['error']}")
+            label = r.get("title") or r["input"]
+            lines.append(f"[{r['index']:03d}] {label}")
+            lines.append(f"      {r['error']}")
         lines.append("")
     if ok:
         lines.append("SUCCEEDED")
         lines.append("-" * 60)
         for r in ok:
-            lines.append(f"[{r['index']:02d}] {r['video_id']}  ({len(r['content'])} chars)")
+            label = f"  {r['title']}" if r.get("title") else ""
+            lines.append(f"[{r['index']:03d}] {r['video_id']}{label}  ({len(r['content'])} chars)")
     return "\n".join(lines) + "\n"
 
 
@@ -540,6 +561,374 @@ def bulk_transcripts(payload: BulkRequest, request: Request):
             )
         )
 
+    return package_results(results, payload.fmt, payload.output)
+
+
+# ---------------------------------------------------------------------------
+# Channel listing (YouTube Data API v3)
+#
+# This is the ONE place the official API is used, and only to answer "which
+# videos exist on this channel". Transcripts still come from the caption
+# endpoint via the proxy -- the Data API cannot give you caption text without
+# OAuth as the channel owner.
+# ---------------------------------------------------------------------------
+
+CHANNEL_ID_RE = re.compile(r"(?:channel/)?(UC[0-9A-Za-z_-]{22})")
+HANDLE_RE = re.compile(r"@([A-Za-z0-9._-]+)")
+LEGACY_USER_RE = re.compile(r"/user/([A-Za-z0-9._-]+)")
+PLAYLIST_RE = re.compile(r"[?&]list=([0-9A-Za-z_-]+)")
+
+
+def require_api_key() -> str:
+    if not YOUTUBE_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Channel mode needs a YouTube Data API key. Set the "
+                "YOUTUBE_API_KEY environment variable (see README)."
+            ),
+        )
+    return YOUTUBE_API_KEY
+
+
+def yt_api(path: str, **params) -> dict:
+    """One call to the YouTube Data API, with readable errors."""
+    params["key"] = require_api_key()
+    try:
+        response = requests.get(f"{YOUTUBE_API_BASE}/{path}", params=params, timeout=20)
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Could not reach the YouTube API: {exc}")
+
+    if response.status_code == 403:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "YouTube API rejected the request. Usually this means the daily "
+                "quota is used up, or the API key is restricted / the YouTube "
+                "Data API v3 is not enabled for it."
+            ),
+        )
+    if response.status_code == 400:
+        raise HTTPException(status_code=400, detail="YouTube API rejected the request (bad key or parameter).")
+    if not response.ok:
+        raise HTTPException(status_code=502, detail=f"YouTube API error {response.status_code}.")
+    return response.json()
+
+
+def resolve_channel(raw: str) -> dict:
+    """Turn a channel URL / @handle / UC id into the info we need.
+
+    Returns {channel_id, title, uploads_playlist, video_count}."""
+    raw = (raw or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Give a channel URL or @handle.")
+
+    # A plain playlist link is also accepted -- treat it as the source list.
+    playlist_match = PLAYLIST_RE.search(raw)
+    if playlist_match and "list=" in raw:
+        playlist_id = playlist_match.group(1)
+        return {
+            "channel_id": None,
+            "title": f"Playlist {playlist_id}",
+            "uploads_playlist": playlist_id,
+            "video_count": None,
+        }
+
+    params: dict
+    if CHANNEL_ID_RE.search(raw):
+        params = {"id": CHANNEL_ID_RE.search(raw).group(1)}
+    elif HANDLE_RE.search(raw):
+        params = {"forHandle": HANDLE_RE.search(raw).group(1)}
+    elif LEGACY_USER_RE.search(raw):
+        params = {"forUsername": LEGACY_USER_RE.search(raw).group(1)}
+    else:
+        # Bare word -- assume it is a handle without the @.
+        params = {"forHandle": raw.rstrip("/").split("/")[-1]}
+
+    data = yt_api("channels", part="snippet,contentDetails,statistics", **params)
+    items = data.get("items") or []
+    if not items:
+        raise HTTPException(
+            status_code=404,
+            detail="No channel found for that link. Try the full URL, or the @handle.",
+        )
+
+    channel = items[0]
+    uploads = (
+        channel.get("contentDetails", {})
+        .get("relatedPlaylists", {})
+        .get("uploads")
+    )
+    if not uploads:
+        raise HTTPException(status_code=502, detail="Channel has no uploads playlist.")
+
+    count = channel.get("statistics", {}).get("videoCount")
+    return {
+        "channel_id": channel.get("id"),
+        "title": channel.get("snippet", {}).get("title", "Unknown channel"),
+        "uploads_playlist": uploads,
+        "video_count": int(count) if count is not None else None,
+    }
+
+
+def list_playlist_videos(playlist_id: str, cap: int) -> list[dict]:
+    """Page through a playlist. 50 videos per API call, 1 quota unit each."""
+    videos: list[dict] = []
+    page_token = None
+    while len(videos) < cap:
+        params = {"part": "contentDetails,snippet", "playlistId": playlist_id, "maxResults": 50}
+        if page_token:
+            params["pageToken"] = page_token
+        data = yt_api("playlistItems", **params)
+
+        for item in data.get("items", []):
+            video_id = item.get("contentDetails", {}).get("videoId")
+            if not video_id:
+                continue
+            videos.append({
+                "video_id": video_id,
+                "title": item.get("snippet", {}).get("title", ""),
+                "published_at": item.get("contentDetails", {}).get("videoPublishedAt", ""),
+            })
+            if len(videos) >= cap:
+                break
+
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+    return videos
+
+
+@app.get("/api/channel")
+def preview_channel(
+    url: str = Query(..., description="Channel URL, @handle, or playlist URL"),
+    limit: int = Query(0, ge=0, description="0 = list everything (up to the cap)"),
+):
+    """Look up a channel and list its videos WITHOUT fetching any transcripts.
+    Cheap and instant -- use it to see how many videos you are about to pull."""
+    info = resolve_channel(url)
+    cap = min(limit or JOB_MAX_VIDEOS, JOB_MAX_VIDEOS)
+    videos = list_playlist_videos(info["uploads_playlist"], cap)
+    return {
+        "channel": info["title"],
+        "channel_id": info["channel_id"],
+        "reported_video_count": info["video_count"],
+        "listed": len(videos),
+        "videos": videos,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Background jobs
+#
+# In-memory only: a redeploy or a Render free-tier sleep loses job state. That
+# is a deliberate trade -- adding a database for something you run occasionally
+# is not worth the operational weight. Download your results when a job ends.
+# ---------------------------------------------------------------------------
+
+class Job:
+    def __init__(self, job_id: str, label: str, videos: list[dict], fmt: str, output: str,
+                 lang: str | None):
+        self.id = job_id
+        self.label = label
+        self.videos = videos
+        self.fmt = fmt
+        self.output = output
+        self.lang = lang
+        self.status = "running"          # running | done | cancelled | error
+        self.created_at = time.time()
+        self.finished_at: float | None = None
+        self.total = len(videos)
+        self.completed = 0
+        self.succeeded = 0
+        self.failed = 0
+        self.results: list[dict] = []
+        self.error = ""
+        self.cancel_requested = False
+        self.lock = threading.Lock()
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            elapsed = (self.finished_at or time.time()) - self.created_at
+            rate = self.completed / elapsed if elapsed > 0 and self.completed else 0
+            remaining = self.total - self.completed
+            return {
+                "id": self.id,
+                "label": self.label,
+                "status": self.status,
+                "total": self.total,
+                "completed": self.completed,
+                "succeeded": self.succeeded,
+                "failed": self.failed,
+                "percent": round(100 * self.completed / self.total, 1) if self.total else 0,
+                "elapsed_seconds": round(elapsed),
+                "eta_seconds": round(remaining / rate) if rate else None,
+                "characters_fetched": sum(len(r["content"]) for r in self.results if r["ok"]),
+                "error": self.error,
+                "download_ready": self.status in ("done", "cancelled") and self.succeeded > 0,
+            }
+
+
+jobs: "OrderedDict[str, Job]" = OrderedDict()
+jobs_lock = threading.Lock()
+
+
+def prune_jobs() -> None:
+    now = time.time()
+    with jobs_lock:
+        stale = [
+            job_id for job_id, job in jobs.items()
+            if job.status != "running" and now - (job.finished_at or job.created_at) > JOB_RETENTION_SECONDS
+        ]
+        for job_id in stale:
+            del jobs[job_id]
+        while len(jobs) > JOB_MAX_KEPT:
+            for job_id, job in list(jobs.items()):
+                if job.status != "running":
+                    del jobs[job_id]
+                    break
+            else:
+                break
+
+
+def running_job() -> Job | None:
+    with jobs_lock:
+        for job in jobs.values():
+            if job.status == "running":
+                return job
+    return None
+
+
+def run_job(job: Job) -> None:
+    """Worker body. Runs in its own thread."""
+    def handle(pair):
+        index, video = pair
+        if job.cancel_requested:
+            return None
+        result = fetch_one_for_bulk(index, video["video_id"], job.fmt, job.lang)
+        result["title"] = video.get("title", "")
+        with job.lock:
+            job.completed += 1
+            if result["ok"]:
+                job.succeeded += 1
+            else:
+                job.failed += 1
+            job.results.append(result)
+        return result
+
+    try:
+        workers = min(BULK_CONCURRENCY, max(1, job.total))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(handle, enumerate(job.videos, start=1)))
+        with job.lock:
+            job.status = "cancelled" if job.cancel_requested else "done"
+    except Exception as exc:  # noqa: BLE001
+        with job.lock:
+            job.status = "error"
+            job.error = str(exc)
+    finally:
+        with job.lock:
+            job.finished_at = time.time()
+            job.results.sort(key=lambda r: r["index"])
+
+
+class JobRequest(BaseModel):
+    channel: str | None = None
+    urls: list[str] = []
+    fmt: str = "txt"
+    output: str = "zip"
+    lang: str | None = None
+    limit: int = 0   # 0 = no limit (up to JOB_MAX_VIDEOS)
+    skip: int = 0    # how many of the newest videos to skip -- lets you resume
+
+
+@app.post("/api/jobs")
+def create_job(payload: JobRequest):
+    if payload.fmt not in ("txt", "srt"):
+        raise HTTPException(status_code=422, detail="fmt must be 'txt' or 'srt'.")
+    if payload.output not in ("zip", "combined"):
+        raise HTTPException(status_code=422, detail="output must be 'zip' or 'combined'.")
+
+    existing = running_job()
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A job is already running ({existing.completed}/{existing.total}). "
+                   "Wait for it or cancel it first.",
+        )
+
+    if payload.channel:
+        info = resolve_channel(payload.channel)
+        wanted = payload.skip + (payload.limit or JOB_MAX_VIDEOS)
+        listed = list_playlist_videos(info["uploads_playlist"], min(wanted, JOB_MAX_VIDEOS))
+        videos = listed[payload.skip:]
+        if payload.limit:
+            videos = videos[: payload.limit]
+        label = info["title"]
+    else:
+        ids = parse_url_list(payload.urls)
+        videos = [{"video_id": extract_video_id(u), "title": ""} for u in ids]
+        label = f"{len(videos)} pasted links"
+
+    if not videos:
+        raise HTTPException(status_code=400, detail="Nothing to fetch.")
+    if len(videos) > JOB_MAX_VIDEOS:
+        raise HTTPException(status_code=413, detail=f"Too many videos (cap is {JOB_MAX_VIDEOS}).")
+
+    prune_jobs()
+    job = Job(uuid.uuid4().hex[:12], label, videos, payload.fmt, payload.output, payload.lang)
+    with jobs_lock:
+        jobs[job.id] = job
+    threading.Thread(target=run_job, args=(job,), daemon=True).start()
+    return job.snapshot()
+
+
+@app.get("/api/jobs")
+def list_jobs():
+    with jobs_lock:
+        return {"jobs": [job.snapshot() for job in reversed(jobs.values())]}
+
+
+def get_job_or_404(job_id: str) -> Job:
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="No such job (it may have expired).")
+    return job
+
+
+@app.get("/api/jobs/{job_id}")
+def job_status(job_id: str):
+    return get_job_or_404(job_id).snapshot()
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    job = get_job_or_404(job_id)
+    job.cancel_requested = True
+    return {"cancelling": True, "id": job.id}
+
+
+@app.get("/api/jobs/{job_id}/download")
+def download_job(job_id: str):
+    job = get_job_or_404(job_id)
+    if job.status == "running":
+        raise HTTPException(status_code=409, detail="Job is still running.")
+    if not job.results:
+        raise HTTPException(status_code=404, detail="Nothing was fetched.")
+    return package_results(job.results, job.fmt, job.output, stem=safe_stem(job.label))
+
+
+SAFE_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def safe_stem(label: str) -> str:
+    stem = SAFE_CHARS.sub("_", (label or "transcripts")).strip("_")
+    return (stem or "transcripts")[:48]
+
+
+def package_results(results: list[dict], fmt: str, output: str, stem: str = "transcripts"):
+    """Shared by bulk mode and jobs: turn results into a zip or one text file."""
     succeeded = sum(1 for r in results if r["ok"])
     report = build_report(results)
     headers = {
@@ -548,27 +937,28 @@ def bulk_transcripts(payload: BulkRequest, request: Request):
         "X-Bulk-Failed": str(len(results) - succeeded),
     }
 
-    if payload.output == "combined":
+    if output == "combined":
         parts = [report, ""]
         for r in results:
             if not r["ok"]:
                 continue
             parts.append("=" * 60)
-            parts.append(f"[{r['index']:02d}] {r['video_id']}  https://youtu.be/{r['video_id']}")
+            title = f"  {r['title']}" if r.get("title") else ""
+            parts.append(f"[{r['index']:02d}] {r['video_id']}{title}")
+            parts.append(f"https://youtu.be/{r['video_id']}")
             parts.append("=" * 60)
             parts.append(r["content"])
             parts.append("")
-        headers["Content-Disposition"] = 'attachment; filename="transcripts.txt"'
+        headers["Content-Disposition"] = f'attachment; filename="{stem}.txt"'
         return Response("\n".join(parts), media_type="text/plain", headers=headers)
 
     buffer = BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         for r in results:
             if r["ok"]:
-                archive.writestr(f"{r['index']:02d}_{r['video_id']}.{payload.fmt}", r["content"])
+                archive.writestr(f"{r['index']:03d}_{r['video_id']}.{fmt}", r["content"])
         archive.writestr("_report.txt", report)
-
-    headers["Content-Disposition"] = 'attachment; filename="transcripts.zip"'
+    headers["Content-Disposition"] = f'attachment; filename="{stem}.zip"'
     return Response(buffer.getvalue(), media_type="application/zip", headers=headers)
 
 

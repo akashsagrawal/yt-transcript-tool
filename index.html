@@ -208,6 +208,49 @@
 
   .hidden { display: none !important; }
 
+  .secondary-btn {
+    background: transparent;
+    color: var(--tape-amber);
+    border: 1px solid var(--tape-amber);
+  }
+  .secondary-btn:hover { background: rgba(232,161,61,0.1); }
+
+  .num-field { display: flex; align-items: center; gap: 8px; }
+  .num-field .field-label { margin: 0; }
+
+  input[type="number"] {
+    width: 90px;
+    background: var(--paper);
+    border: 1px solid var(--rule);
+    color: var(--ink);
+    padding: 8px 10px;
+    font-family: inherit;
+    font-size: 13px;
+  }
+  input[type="number"]:focus { outline: none; border-color: var(--tape-amber); }
+
+  .progress-box {
+    margin-top: 20px;
+    border: 1px solid var(--rule);
+    background: var(--paper);
+    padding: 16px;
+  }
+
+  .progress-line { font-size: 13px; margin-bottom: 10px; }
+
+  .bar {
+    height: 6px;
+    background: var(--rule);
+    overflow: hidden;
+  }
+
+  .bar-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--tape-amber);
+    transition: width 0.4s ease;
+  }
+
   ::-webkit-scrollbar { width: 8px; }
   ::-webkit-scrollbar-track { background: var(--paper); }
   ::-webkit-scrollbar-thumb { background: var(--rule); }
@@ -224,6 +267,7 @@
   <div class="tabs">
     <button class="tab active" data-mode="single">Single</button>
     <button class="tab" data-mode="bulk">Bulk</button>
+    <button class="tab" data-mode="channel">Channel</button>
   </div>
 
   <div class="console">
@@ -253,6 +297,50 @@
         </div>
       </div>
       <button id="goBulk">Pull all</button>
+    </div>
+
+    <!-- ---------- CHANNEL ---------- -->
+    <div id="pane-channel" class="hidden">
+      <label class="field-label" for="channel">Channel URL or @handle</label>
+      <div class="url-row">
+        <input type="text" id="channel" placeholder="https://www.youtube.com/@channelname" />
+        <button id="checkChannel" class="secondary-btn">Check</button>
+      </div>
+      <div class="hint" id="channelInfo">
+        Checking a channel is free and instant — it only lists the videos, nothing is downloaded yet.
+      </div>
+
+      <div id="channelOptions" class="hidden">
+        <div class="options-row">
+          <div class="num-field">
+            <span class="field-label">Skip newest</span>
+            <input type="number" id="skip" value="0" min="0" />
+          </div>
+          <div class="num-field">
+            <span class="field-label">How many</span>
+            <input type="number" id="limit" value="0" min="0" placeholder="0 = all" />
+          </div>
+          <div class="radio-group">
+            <span class="field-label" style="margin:0;">Deliver as</span>
+            <label><input type="radio" name="choutput" value="zip" checked> .zip</label>
+            <label><input type="radio" name="choutput" value="combined"> One file</label>
+          </div>
+        </div>
+        <div class="hint">
+          <b>Skip newest</b> + <b>How many</b> let you go in batches — e.g. skip 0 / how many 200,
+          then skip 200 / how many 200. Useful if proxy bandwidth runs out partway.
+        </div>
+        <button id="startJob">Start job</button>
+      </div>
+
+      <div id="progressBox" class="progress-box hidden">
+        <div class="progress-line"><span id="progressLabel">Starting…</span></div>
+        <div class="bar"><div class="bar-fill" id="barFill"></div></div>
+        <div class="hint" id="progressDetail"></div>
+        <div class="actions" id="jobActions" style="display:flex;">
+          <button id="cancelJob" class="secondary">Cancel job</button>
+        </div>
+      </div>
     </div>
 
     <!-- ---------- SHARED ---------- -->
@@ -314,13 +402,13 @@
   }
 
   // ---------- tabs ----------
+  const MODES = ['single', 'bulk', 'channel'];
+
   document.querySelectorAll('.tab').forEach((tab) => {
     tab.addEventListener('click', () => {
       document.querySelectorAll('.tab').forEach((t) => t.classList.remove('active'));
       tab.classList.add('active');
-      const bulk = tab.dataset.mode === 'bulk';
-      $('pane-single').classList.toggle('hidden', bulk);
-      $('pane-bulk').classList.toggle('hidden', !bulk);
+      MODES.forEach((m) => $('pane-' + m).classList.toggle('hidden', m !== tab.dataset.mode));
       setStatus('');
       resetOutput();
     });
@@ -437,6 +525,166 @@
       goBulkBtn.disabled = false;
     }
   }
+
+  // ---------- channel ----------
+  const channelInput = $('channel');
+  const checkBtn = $('checkChannel');
+  const channelInfoEl = $('channelInfo');
+  const channelOptionsEl = $('channelOptions');
+  const startJobBtn = $('startJob');
+  const progressBox = $('progressBox');
+  const progressLabel = $('progressLabel');
+  const progressDetail = $('progressDetail');
+  const barFill = $('barFill');
+  const cancelJobBtn = $('cancelJob');
+
+  let currentJobId = null;
+  let pollTimer = null;
+  let knownVideoCount = 0;
+
+  function fmtDuration(seconds) {
+    if (seconds == null) return '—';
+    const m = Math.floor(seconds / 60), s = Math.round(seconds % 60);
+    return m ? `${m}m ${s}s` : `${s}s`;
+  }
+
+  async function checkChannel() {
+    const url = channelInput.value.trim();
+    if (!url) { setStatus('Paste a channel URL or @handle.', 'error'); return; }
+
+    checkBtn.disabled = true;
+    setStatus('Looking up channel…');
+    channelOptionsEl.classList.add('hidden');
+
+    try {
+      const resp = await fetch(`/api/channel?url=${encodeURIComponent(url)}`);
+      const body = await resp.json();
+      if (!resp.ok) throw new Error(body.detail || `Lookup failed (${resp.status})`);
+
+      knownVideoCount = body.listed;
+      const sample = body.videos.slice(0, 3).map((v) => '· ' + v.title).join('<br>');
+      channelInfoEl.innerHTML =
+        `<b>${body.channel}</b> — ${body.listed} videos found.<br>${sample}` +
+        (body.listed > 3 ? '<br>…' : '');
+      $('limit').placeholder = `0 = all ${body.listed}`;
+      channelOptionsEl.classList.remove('hidden');
+      setStatus('Channel found. Nothing downloaded yet — set the range and start the job.', 'ok');
+    } catch (err) {
+      setStatus(err.message || 'Lookup failed.', 'error');
+    } finally {
+      checkBtn.disabled = false;
+    }
+  }
+
+  async function startJob() {
+    const body = {
+      channel: channelInput.value.trim(),
+      fmt: document.querySelector('input[name="fmt"]:checked').value,
+      output: document.querySelector('input[name="choutput"]:checked').value,
+      skip: Number($('skip').value) || 0,
+      limit: Number($('limit').value) || 0,
+    };
+
+    startJobBtn.disabled = true;
+    resetOutput();
+    setStatus('Starting job…');
+
+    try {
+      const resp = await fetch('/api/jobs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const job = await resp.json();
+      if (!resp.ok) throw new Error(job.detail || `Could not start (${resp.status})`);
+
+      currentJobId = job.id;
+      progressBox.classList.remove('hidden');
+      cancelJobBtn.classList.remove('hidden');
+      setStatus('Job running. You can leave this page open — it keeps going.', 'ok');
+      pollJob();
+    } catch (err) {
+      setStatus(err.message || 'Could not start the job.', 'error');
+      startJobBtn.disabled = false;
+    }
+  }
+
+  async function pollJob() {
+    if (!currentJobId) return;
+    try {
+      const resp = await fetch(`/api/jobs/${currentJobId}`);
+      const job = await resp.json();
+      if (!resp.ok) throw new Error(job.detail || 'Lost track of the job.');
+
+      barFill.style.width = job.percent + '%';
+      progressLabel.textContent =
+        `${job.completed} / ${job.total} done · ${job.percent}%`;
+      progressDetail.innerHTML =
+        `${job.succeeded} ok · ${job.failed} failed · ` +
+        `elapsed ${fmtDuration(job.elapsed_seconds)}` +
+        (job.status === 'running' ? ` · ETA ${fmtDuration(job.eta_seconds)}` : '') +
+        `<br>${(job.characters_fetched / 1000).toFixed(0)}k characters pulled`;
+
+      if (job.status === 'running') {
+        pollTimer = setTimeout(pollJob, 2000);
+        return;
+      }
+
+      // Finished, one way or another.
+      cancelJobBtn.classList.add('hidden');
+      startJobBtn.disabled = false;
+
+      if (job.download_ready) {
+        const dl = await fetch(`/api/jobs/${currentJobId}/download`);
+        const blob = await dl.blob();
+        const disposition = dl.headers.get('Content-Disposition') || '';
+        const match = disposition.match(/filename="(.+)"/);
+        const isText = (dl.headers.get('Content-Type') || '').startsWith('text/');
+        offerBlob(blob, match ? match[1] : 'transcripts.zip', null);
+        if (!isText) copyBtn.classList.add('hidden');
+        bumpCounter(job.succeeded);
+        setStatus(
+          `${job.status === 'cancelled' ? 'Cancelled — partial results ready. ' : 'Job finished. '}` +
+          `${job.succeeded} of ${job.total} pulled` +
+          (job.failed ? ` · ${job.failed} had no captions or failed (see _report.txt)` : '') +
+          '. Download below.',
+          job.failed ? 'error' : 'ok'
+        );
+      } else {
+        setStatus(job.error || 'Job ended with nothing to download.', 'error');
+      }
+    } catch (err) {
+      setStatus(err.message || 'Lost track of the job.', 'error');
+      startJobBtn.disabled = false;
+    }
+  }
+
+  cancelJobBtn.addEventListener('click', async () => {
+    if (!currentJobId) return;
+    cancelJobBtn.disabled = true;
+    await fetch(`/api/jobs/${currentJobId}/cancel`, { method: 'POST' }).catch(() => {});
+    setStatus('Cancelling — finishing the videos already in flight…');
+    setTimeout(() => { cancelJobBtn.disabled = false; }, 3000);
+  });
+
+  checkBtn.addEventListener('click', checkChannel);
+  channelInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') checkChannel(); });
+  startJobBtn.addEventListener('click', startJob);
+
+  // If a job is already running (e.g. you reloaded the page), reattach to it.
+  fetch('/api/jobs')
+    .then((r) => r.json())
+    .then((body) => {
+      const running = (body.jobs || []).find((j) => j.status === 'running');
+      if (!running) return;
+      currentJobId = running.id;
+      document.querySelector('.tab[data-mode="channel"]').click();
+      progressBox.classList.remove('hidden');
+      startJobBtn.disabled = true;
+      setStatus('Reattached to a job that was already running.', 'ok');
+      pollJob();
+    })
+    .catch(() => {});
 
   // ---------- shared actions ----------
   downloadBtn.addEventListener('click', () => {

@@ -105,6 +105,75 @@ Don't raise `BULK_CONCURRENCY` much. Twenty simultaneous requests through the
 proxy is a good way to get flagged, and the gain is small since the slow part
 is YouTube, not you.
 
+## Channel mode — a whole channel in one go
+
+The **Channel** tab takes a channel URL or `@handle`, lists every video on it,
+and pulls the transcripts as a background job with a live progress bar.
+
+Two steps on purpose:
+
+1. **Check** — lists the videos. Free, instant, downloads nothing. You see the
+   count before committing to anything.
+2. **Start job** — actually fetches. Runs in the background, so closing the tab
+   or reloading the page doesn't kill it; reopening reattaches to the progress.
+
+### The API key
+
+Listing a channel's videos uses the official **YouTube Data API v3**. Getting a
+key is free:
+
+1. https://console.cloud.google.com/ → create a project
+2. **APIs & Services → Library** → search "YouTube Data API v3" → **Enable**
+3. **APIs & Services → Credentials → Create credentials → API key** → copy it
+4. Render → **Environment** → add `YOUTUBE_API_KEY` = your key → Save
+
+Quota is 10,000 units/day. Listing 1,000 videos costs about 21 units, so this
+is not a limit you will notice.
+
+Without the key the rest of the tool still works — only the Channel tab returns
+a 503 telling you it's missing. Check `/api/health` for
+`"youtube_api_key_set": true`.
+
+Note the key only lists *which videos exist*. Caption text still comes through
+the proxy — the Data API can't hand out transcripts unless you're the channel
+owner authenticating with OAuth.
+
+### Going in batches
+
+**Skip newest** and **How many** exist because of proxy bandwidth. Each
+transcript costs roughly 200–500 KB of proxy traffic, so a 1,000-video channel
+can eat most of a 1 GB plan. Run `skip 0 / how many 200`, then `skip 200 / how
+many 200`, and so on. Anything already pulled in the last 24 hours comes from
+cache and costs nothing.
+
+### Job endpoints
+
+```
+GET  /api/channel?url=@handle      list videos, fetch nothing
+POST /api/jobs                     {channel, fmt, output, skip, limit}
+GET  /api/jobs/{id}                progress, ETA, counts
+POST /api/jobs/{id}/cancel         stop early, keep what's done
+GET  /api/jobs/{id}/download       zip or combined file
+```
+
+One job runs at a time — the proxy is the bottleneck, so a second parallel job
+would only slow the first one down. Jobs live in memory and are dropped after 6
+hours or a redeploy, so download your results when a job finishes.
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `YOUTUBE_API_KEY` | *(unset)* | Enables channel mode |
+| `JOB_MAX_VIDEOS` | `2000` | Hard cap on videos per job |
+| `JOB_RETENTION_SECONDS` | `21600` | How long finished jobs stay downloadable |
+
+### Videos with no captions
+
+Some videos have captions switched off by the uploader. There is no transcript
+to fetch and no tool can produce one without running speech-to-text on the
+audio. Those videos are skipped, counted as failures, and listed with the
+reason in `_report.txt`. A run of 1,000 videos will normally have some of
+these — that's expected, not a bug.
+
 ## Caching and rate limiting
 
 Two things were added so a public link can't quietly cost you money:
