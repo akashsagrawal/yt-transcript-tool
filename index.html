@@ -13,6 +13,7 @@
     --tape-amber: #e8a13d;
     --rule: #35332e;
     --error: #d9695f;
+    --ok: #8fae7a;
   }
 
   * { box-sizing: border-box; }
@@ -36,7 +37,7 @@
     max-width: 720px;
     border-bottom: 1px solid var(--rule);
     padding-bottom: 20px;
-    margin-bottom: 36px;
+    margin-bottom: 28px;
   }
 
   .masthead .eyebrow {
@@ -62,6 +63,32 @@
     line-height: 1.5;
   }
 
+  .tabs {
+    width: 100%;
+    max-width: 720px;
+    display: flex;
+    gap: 4px;
+    margin-bottom: -1px;
+  }
+
+  .tab {
+    background: transparent;
+    border: 1px solid var(--rule);
+    border-bottom: none;
+    color: var(--ink-dim);
+    padding: 10px 20px;
+    font-family: inherit;
+    font-size: 12px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    cursor: pointer;
+  }
+
+  .tab.active {
+    background: var(--paper-raised);
+    color: var(--tape-amber);
+  }
+
   .console {
     width: 100%;
     max-width: 720px;
@@ -79,13 +106,11 @@
     margin-bottom: 8px;
   }
 
-  .url-row {
-    display: flex;
-    gap: 10px;
-  }
+  .url-row { display: flex; gap: 10px; }
 
-  input[type="text"] {
+  input[type="text"], textarea {
     flex: 1;
+    width: 100%;
     background: var(--paper);
     border: 1px solid var(--rule);
     color: var(--ink);
@@ -94,10 +119,18 @@
     font-size: 14px;
   }
 
-  input[type="text"]:focus {
+  textarea {
+    min-height: 160px;
+    resize: vertical;
+    line-height: 1.6;
+  }
+
+  input[type="text"]:focus, textarea:focus {
     outline: none;
     border-color: var(--tape-amber);
   }
+
+  textarea.dragover { border-color: var(--tape-amber); background: rgba(232,161,61,0.05); }
 
   .options-row {
     display: flex;
@@ -106,11 +139,7 @@
     flex-wrap: wrap;
   }
 
-  .radio-group {
-    display: flex;
-    gap: 14px;
-    align-items: center;
-  }
+  .radio-group { display: flex; gap: 14px; align-items: center; }
 
   .radio-group label {
     font-size: 13px;
@@ -139,14 +168,9 @@
   button:hover { background: #f2b158; }
   button:disabled { background: var(--rule); color: var(--ink-dim); cursor: not-allowed; }
 
-  .status {
-    margin-top: 16px;
-    font-size: 13px;
-    min-height: 18px;
-  }
-
+  .status { margin-top: 16px; font-size: 13px; min-height: 18px; }
   .status.error { color: var(--error); }
-  .status.ok { color: #8fae7a; }
+  .status.ok { color: var(--ok); }
 
   .reel {
     margin-top: 20px;
@@ -162,11 +186,7 @@
     display: none;
   }
 
-  .actions {
-    margin-top: 16px;
-    display: none;
-    gap: 10px;
-  }
+  .actions { margin-top: 16px; display: none; gap: 10px; }
 
   .actions button.secondary {
     background: transparent;
@@ -176,12 +196,17 @@
 
   .actions button.secondary:hover { background: rgba(232,161,61,0.1); }
 
+  .hint { font-size: 12px; color: var(--ink-dim); margin-top: 8px; line-height: 1.6; }
+  .hint b { color: var(--ink); font-weight: normal; }
+
   .counter {
     font-size: 11px;
     color: var(--ink-dim);
     margin-top: 24px;
     letter-spacing: 0.05em;
   }
+
+  .hidden { display: none !important; }
 
   ::-webkit-scrollbar { width: 8px; }
   ::-webkit-scrollbar-track { background: var(--paper); }
@@ -193,16 +218,44 @@
   <div class="masthead">
     <div class="eyebrow">Reel &rarr; Text</div>
     <h1>Transcript Puller</h1>
-    <p>Paste any YouTube link. Pull the caption track straight off it as plain text or subtitle file — no sign-in, no per-use limit.</p>
+    <p>Paste any YouTube link. Pull the caption track straight off it as plain text or subtitle file — one at a time, or a whole batch at once.</p>
+  </div>
+
+  <div class="tabs">
+    <button class="tab active" data-mode="single">Single</button>
+    <button class="tab" data-mode="bulk">Bulk</button>
   </div>
 
   <div class="console">
-    <label class="field-label" for="url">YouTube URL or video ID</label>
-    <div class="url-row">
-      <input type="text" id="url" placeholder="https://www.youtube.com/watch?v=..." />
-      <button id="go">Pull it</button>
+
+    <!-- ---------- SINGLE ---------- -->
+    <div id="pane-single">
+      <label class="field-label" for="url">YouTube URL or video ID</label>
+      <div class="url-row">
+        <input type="text" id="url" placeholder="https://www.youtube.com/watch?v=..." />
+        <button id="go">Pull it</button>
+      </div>
     </div>
 
+    <!-- ---------- BULK ---------- -->
+    <div id="pane-bulk" class="hidden">
+      <label class="field-label" for="urls">YouTube links — one per line</label>
+      <textarea id="urls" placeholder="https://youtu.be/xxxxxxxxxxx&#10;https://www.youtube.com/watch?v=yyyyyyyyyyy&#10;zzzzzzzzzzz"></textarea>
+      <div class="hint">
+        <span id="linkcount">0 links</span> · limit <b id="maxlinks">25</b> per run.
+        You can also drag a <b>.txt</b> file of links onto the box.
+      </div>
+      <div class="options-row">
+        <div class="radio-group">
+          <span class="field-label" style="margin:0;">Deliver as</span>
+          <label><input type="radio" name="output" value="zip" checked> Separate files (.zip)</label>
+          <label><input type="radio" name="output" value="combined"> One combined file</label>
+        </div>
+      </div>
+      <button id="goBulk">Pull all</button>
+    </div>
+
+    <!-- ---------- SHARED ---------- -->
     <div class="options-row">
       <div class="radio-group">
         <span class="field-label" style="margin:0;">Format</span>
@@ -222,33 +275,97 @@
   <div class="counter" id="counter">0 transcripts pulled this session</div>
 
 <script>
-  const urlInput = document.getElementById('url');
-  const goBtn = document.getElementById('go');
-  const statusEl = document.getElementById('status');
-  const reelEl = document.getElementById('reel');
-  const actionsEl = document.getElementById('actions');
-  const downloadBtn = document.getElementById('download');
-  const copyBtn = document.getElementById('copy');
-  const counterEl = document.getElementById('counter');
+  const $ = (id) => document.getElementById(id);
 
-  let lastBlobUrl = null;
-  let lastFilename = null;
-  let lastText = '';
-  let sessionCount = 0;
+  const urlInput = $('url'), goBtn = $('go');
+  const urlsInput = $('urls'), goBulkBtn = $('goBulk');
+  const statusEl = $('status'), reelEl = $('reel'), actionsEl = $('actions');
+  const downloadBtn = $('download'), copyBtn = $('copy'), counterEl = $('counter');
+  const linkCountEl = $('linkcount'), maxLinksEl = $('maxlinks');
+
+  let lastBlobUrl = null, lastFilename = null, lastText = '', sessionCount = 0;
 
   function setStatus(msg, kind) {
     statusEl.textContent = msg;
     statusEl.className = 'status' + (kind ? ' ' + kind : '');
   }
 
+  function resetOutput() {
+    reelEl.style.display = 'none';
+    actionsEl.style.display = 'none';
+    copyBtn.classList.remove('hidden');
+  }
+
+  function bumpCounter(n) {
+    sessionCount += n;
+    counterEl.textContent = `${sessionCount} transcript${sessionCount === 1 ? '' : 's'} pulled this session`;
+  }
+
+  function offerBlob(blob, filename, previewText) {
+    if (lastBlobUrl) URL.revokeObjectURL(lastBlobUrl);
+    lastBlobUrl = URL.createObjectURL(blob);
+    lastFilename = filename;
+    lastText = previewText || '';
+    if (previewText) {
+      reelEl.textContent = previewText;
+      reelEl.style.display = 'block';
+    }
+    actionsEl.style.display = 'flex';
+  }
+
+  // ---------- tabs ----------
+  document.querySelectorAll('.tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach((t) => t.classList.remove('active'));
+      tab.classList.add('active');
+      const bulk = tab.dataset.mode === 'bulk';
+      $('pane-single').classList.toggle('hidden', bulk);
+      $('pane-bulk').classList.toggle('hidden', !bulk);
+      setStatus('');
+      resetOutput();
+    });
+  });
+
+  // ---------- link counting + file drop ----------
+  function splitLinks(text) {
+    return (text || '').split(/[\s,;]+/).filter(Boolean);
+  }
+
+  function updateCount() {
+    const n = new Set(splitLinks(urlsInput.value)).size;
+    linkCountEl.textContent = `${n} link${n === 1 ? '' : 's'}`;
+  }
+
+  urlsInput.addEventListener('input', updateCount);
+
+  urlsInput.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    urlsInput.classList.add('dragover');
+  });
+  urlsInput.addEventListener('dragleave', () => urlsInput.classList.remove('dragover'));
+  urlsInput.addEventListener('drop', (e) => {
+    e.preventDefault();
+    urlsInput.classList.remove('dragover');
+    const file = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const existing = urlsInput.value.trim();
+      urlsInput.value = (existing ? existing + '\n' : '') + reader.result;
+      updateCount();
+      setStatus(`Loaded ${file.name}.`, 'ok');
+    };
+    reader.readAsText(file);
+  });
+
+  // ---------- single ----------
   async function pull() {
     const url = urlInput.value.trim();
     if (!url) { setStatus('Paste a YouTube URL or video ID first.', 'error'); return; }
     const fmt = document.querySelector('input[name="fmt"]:checked').value;
 
     goBtn.disabled = true;
-    reelEl.style.display = 'none';
-    actionsEl.style.display = 'none';
+    resetOutput();
     setStatus('Pulling transcript…');
 
     try {
@@ -260,20 +377,9 @@
       const text = await resp.text();
       const disposition = resp.headers.get('Content-Disposition') || '';
       const match = disposition.match(/filename="(.+)"/);
-      lastFilename = match ? match[1] : `transcript.${fmt}`;
-      lastText = text;
-
-      if (lastBlobUrl) URL.revokeObjectURL(lastBlobUrl);
-      const blob = new Blob([text], { type: 'text/plain' });
-      lastBlobUrl = URL.createObjectURL(blob);
-
-      reelEl.textContent = text;
-      reelEl.style.display = 'block';
-      actionsEl.style.display = 'flex';
+      offerBlob(new Blob([text], { type: 'text/plain' }), match ? match[1] : `transcript.${fmt}`, text);
       setStatus('Done. Preview below, or download / copy.', 'ok');
-
-      sessionCount++;
-      counterEl.textContent = `${sessionCount} transcript${sessionCount === 1 ? '' : 's'} pulled this session`;
+      bumpCounter(1);
     } catch (err) {
       setStatus(err.message || 'Something went wrong.', 'error');
     } finally {
@@ -281,6 +387,58 @@
     }
   }
 
+  // ---------- bulk ----------
+  async function pullBulk() {
+    const links = splitLinks(urlsInput.value);
+    if (!links.length) { setStatus('Paste some YouTube links first.', 'error'); return; }
+
+    const fmt = document.querySelector('input[name="fmt"]:checked').value;
+    const output = document.querySelector('input[name="output"]:checked').value;
+    const unique = [...new Set(links)];
+
+    goBulkBtn.disabled = true;
+    resetOutput();
+    setStatus(`Pulling ${unique.length} transcript${unique.length === 1 ? '' : 's'}… this can take a minute.`);
+
+    try {
+      const resp = await fetch('/api/bulk', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ urls: unique, fmt, output }),
+      });
+      if (!resp.ok) {
+        const body = await resp.json().catch(() => ({}));
+        throw new Error(body.detail || `Request failed (${resp.status})`);
+      }
+
+      const total = Number(resp.headers.get('X-Bulk-Total') || unique.length);
+      const okCount = Number(resp.headers.get('X-Bulk-Succeeded') || 0);
+      const failed = Number(resp.headers.get('X-Bulk-Failed') || 0);
+
+      if (output === 'combined') {
+        const text = await resp.text();
+        offerBlob(new Blob([text], { type: 'text/plain' }), 'transcripts.txt', text);
+      } else {
+        const blob = await resp.blob();
+        offerBlob(blob, 'transcripts.zip', null);
+        copyBtn.classList.add('hidden'); // nothing sensible to copy from a zip
+      }
+
+      setStatus(
+        `${okCount} of ${total} pulled` +
+        (failed ? ` · ${failed} failed (see _report.txt)` : '') +
+        '. Download below.',
+        failed ? 'error' : 'ok'
+      );
+      bumpCounter(okCount);
+    } catch (err) {
+      setStatus(err.message || 'Something went wrong.', 'error');
+    } finally {
+      goBulkBtn.disabled = false;
+    }
+  }
+
+  // ---------- shared actions ----------
   downloadBtn.addEventListener('click', () => {
     if (!lastBlobUrl) return;
     const a = document.createElement('a');
@@ -303,6 +461,13 @@
 
   goBtn.addEventListener('click', pull);
   urlInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') pull(); });
+  goBulkBtn.addEventListener('click', pullBulk);
+
+  // Show the server's real bulk cap.
+  fetch('/api/health')
+    .then((r) => r.json())
+    .then((h) => { if (h.bulk && h.bulk.max_urls) maxLinksEl.textContent = h.bulk.max_urls; })
+    .catch(() => {});
 </script>
 </body>
 </html>

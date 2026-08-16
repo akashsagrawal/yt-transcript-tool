@@ -26,13 +26,16 @@ import os
 import re
 import threading
 import time
+import zipfile
 from collections import OrderedDict, deque
-from io import StringIO
+from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO, StringIO
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from youtube_transcript_api import (
     IpBlocked,
@@ -70,6 +73,12 @@ CACHE_MAX_ENTRIES = _env_int("CACHE_MAX_ENTRIES", 500)
 
 RATE_LIMIT_REQUESTS = _env_int("RATE_LIMIT_REQUESTS", 20)
 RATE_LIMIT_WINDOW_SECONDS = _env_int("RATE_LIMIT_WINDOW_SECONDS", 60)
+
+# Bulk mode: how many links one request may carry, and how many of them to
+# fetch at the same time. Keep concurrency modest -- hammering YouTube through
+# the proxy with 20 parallel requests is exactly how you get blocked.
+BULK_MAX_URLS = _env_int("BULK_MAX_URLS", 25)
+BULK_CONCURRENCY = max(1, _env_int("BULK_CONCURRENCY", 4))
 
 # Comma-separated list, or "*" for any origin.
 ALLOWED_ORIGINS = [
@@ -169,10 +178,15 @@ class RateLimiter:
         self._hits: "dict[str, deque]" = {}
         self._lock = threading.Lock()
 
-    def check(self, key: str) -> tuple[bool, int]:
-        """Return (allowed, seconds_until_retry)."""
+    def check(self, key: str, cost: int = 1) -> tuple[bool, int]:
+        """Return (allowed, seconds_until_retry).
+
+        `cost` lets one HTTP request consume several slots -- a bulk job for 10
+        videos costs 10, because it does 10 YouTube fetches. Without this, bulk
+        mode would be a hole straight through the rate limit."""
         if self.max_requests <= 0:  # 0 or negative disables the limiter
             return True, 0
+        cost = max(1, cost)
         now = time.time()
         cutoff = now - self.window
         with self._lock:
@@ -180,11 +194,11 @@ class RateLimiter:
             while bucket and bucket[0] < cutoff:
                 bucket.popleft()
 
-            if len(bucket) >= self.max_requests:
-                retry_after = int(bucket[0] + self.window - now) + 1
+            if len(bucket) + cost > self.max_requests:
+                retry_after = int(bucket[0] + self.window - now) + 1 if bucket else 1
                 return False, max(retry_after, 1)
 
-            bucket.append(now)
+            bucket.extend([now] * cost)
 
             # Occasional housekeeping so idle IPs don't accumulate forever.
             if len(self._hits) > 5000:
@@ -205,20 +219,26 @@ def client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def enforce_rate_limit(request: Request) -> None:
-    """FastAPI dependency. Attached to the API routes only, so the static
-    frontend is never rate limited."""
-    allowed, retry_after = rate_limiter.check(client_ip(request))
+def charge_rate_limit(request: Request, cost: int = 1) -> None:
+    """Consume `cost` slots for this caller, or raise 429."""
+    allowed, retry_after = rate_limiter.check(client_ip(request), cost=cost)
     if not allowed:
         raise HTTPException(
             status_code=429,
             detail=(
                 f"Too many requests. Limit is {RATE_LIMIT_REQUESTS} per "
-                f"{RATE_LIMIT_WINDOW_SECONDS} seconds. Try again in "
-                f"{retry_after} seconds."
+                f"{RATE_LIMIT_WINDOW_SECONDS} seconds"
+                + (f" and this job needs {cost}" if cost > 1 else "")
+                + f". Try again in {retry_after} seconds."
             ),
             headers={"Retry-After": str(retry_after)},
         )
+
+
+def enforce_rate_limit(request: Request) -> None:
+    """FastAPI dependency for single-video routes. Attached to the API routes
+    only, so the static frontend is never rate limited."""
+    charge_rate_limit(request, cost=1)
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +380,7 @@ def health():
             "requests": RATE_LIMIT_REQUESTS,
             "window_seconds": RATE_LIMIT_WINDOW_SECONDS,
         },
+        "bulk": {"max_urls": BULK_MAX_URLS, "concurrency": BULK_CONCURRENCY},
         "transcript_cache": transcript_cache.stats(),
         "language_cache": language_cache.stats(),
     }
@@ -409,6 +430,146 @@ def get_languages(url: str = Query(...)):
 
     language_cache.set(video_id, langs)
     return {"video_id": video_id, "available": langs, "cached": False}
+
+
+# ---------------------------------------------------------------------------
+# Bulk mode -- many links in one go
+# ---------------------------------------------------------------------------
+
+SPLIT_PATTERN = re.compile(r"[\s,;]+")
+
+
+class BulkRequest(BaseModel):
+    urls: list[str] = []
+    fmt: str = "txt"
+    lang: str | None = None
+    output: str = "zip"  # "zip" = one file per video, "combined" = single file
+
+
+def parse_url_list(raw: list[str]) -> list[str]:
+    """Accept anything reasonable: a proper list, or one blob of text with the
+    links separated by newlines, commas, spaces. Duplicates are dropped so the
+    same video is never fetched twice in one job."""
+    items: list[str] = []
+    for chunk in raw or []:
+        items.extend(part for part in SPLIT_PATTERN.split(chunk or "") if part)
+
+    seen = set()
+    unique = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            unique.append(item)
+    return unique
+
+
+def fetch_one_for_bulk(index: int, raw_url: str, fmt: str, lang: str | None) -> dict:
+    """Never raises -- a failure for one video must not sink the whole job."""
+    result = {"index": index, "input": raw_url, "video_id": None, "ok": False,
+              "content": "", "error": ""}
+    try:
+        video_id = extract_video_id(raw_url)
+        result["video_id"] = video_id
+        snippets = fetch_snippets(video_id, lang)
+        result["content"] = to_srt(snippets) if fmt == "srt" else to_plain_text(snippets)
+        result["ok"] = True
+    except HTTPException as exc:
+        result["error"] = str(exc.detail)
+    except Exception as exc:  # noqa: BLE001 -- last-resort guard
+        result["error"] = f"Unexpected error: {exc}"
+    return result
+
+
+def build_report(results: list[dict]) -> str:
+    ok = [r for r in results if r["ok"]]
+    failed = [r for r in results if not r["ok"]]
+    lines = [
+        "TRANSCRIPT PULLER - BULK REPORT",
+        "=" * 60,
+        f"Requested: {len(results)}",
+        f"Succeeded: {len(ok)}",
+        f"Failed:    {len(failed)}",
+        "",
+    ]
+    if failed:
+        lines.append("FAILURES")
+        lines.append("-" * 60)
+        for r in failed:
+            lines.append(f"[{r['index']:02d}] {r['input']}")
+            lines.append(f"     {r['error']}")
+        lines.append("")
+    if ok:
+        lines.append("SUCCEEDED")
+        lines.append("-" * 60)
+        for r in ok:
+            lines.append(f"[{r['index']:02d}] {r['video_id']}  ({len(r['content'])} chars)")
+    return "\n".join(lines) + "\n"
+
+
+@app.post("/api/bulk")
+def bulk_transcripts(payload: BulkRequest, request: Request):
+    """Fetch many transcripts at once.
+
+    Returns a ZIP (one file per video plus a report), or a single combined
+    text file. Videos that fail are listed in the report rather than failing
+    the whole request -- one dead link in twenty shouldn't cost you the other
+    nineteen."""
+    if payload.fmt not in ("txt", "srt"):
+        raise HTTPException(status_code=422, detail="fmt must be 'txt' or 'srt'.")
+    if payload.output not in ("zip", "combined"):
+        raise HTTPException(status_code=422, detail="output must be 'zip' or 'combined'.")
+
+    urls = parse_url_list(payload.urls)
+    if not urls:
+        raise HTTPException(status_code=400, detail="No YouTube links found in the input.")
+    if len(urls) > BULK_MAX_URLS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Too many links ({len(urls)}). The limit is {BULK_MAX_URLS} per request.",
+        )
+
+    # One slot per video, not per HTTP request.
+    charge_rate_limit(request, cost=len(urls))
+
+    workers = min(BULK_CONCURRENCY, len(urls))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(
+            pool.map(
+                lambda pair: fetch_one_for_bulk(pair[0], pair[1], payload.fmt, payload.lang),
+                enumerate(urls, start=1),
+            )
+        )
+
+    succeeded = sum(1 for r in results if r["ok"])
+    report = build_report(results)
+    headers = {
+        "X-Bulk-Total": str(len(results)),
+        "X-Bulk-Succeeded": str(succeeded),
+        "X-Bulk-Failed": str(len(results) - succeeded),
+    }
+
+    if payload.output == "combined":
+        parts = [report, ""]
+        for r in results:
+            if not r["ok"]:
+                continue
+            parts.append("=" * 60)
+            parts.append(f"[{r['index']:02d}] {r['video_id']}  https://youtu.be/{r['video_id']}")
+            parts.append("=" * 60)
+            parts.append(r["content"])
+            parts.append("")
+        headers["Content-Disposition"] = 'attachment; filename="transcripts.txt"'
+        return Response("\n".join(parts), media_type="text/plain", headers=headers)
+
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for r in results:
+            if r["ok"]:
+                archive.writestr(f"{r['index']:02d}_{r['video_id']}.{payload.fmt}", r["content"])
+        archive.writestr("_report.txt", report)
+
+    headers["Content-Disposition"] = 'attachment; filename="transcripts.zip"'
+    return Response(buffer.getvalue(), media_type="application/zip", headers=headers)
 
 
 # The static frontend is mounted last so it does not shadow the /api routes.

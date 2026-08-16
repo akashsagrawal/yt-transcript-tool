@@ -166,6 +166,80 @@ def test_blocked_ip_returns_503_with_guidance(client, monkeypatch):
     assert "blocking" in res.json()["detail"].lower()
 
 
+# ---------------------------------------------------------------------------
+# Bulk mode
+# ---------------------------------------------------------------------------
+
+import io
+import zipfile
+
+THREE_IDS = ["dQw4w9WgXcQ", "aBcDeFgHiJk", "12345678901"]
+
+
+def test_bulk_zip_contains_one_file_per_video_plus_report(client):
+    res = client.post("/api/bulk", json={"urls": THREE_IDS})
+    assert res.status_code == 200
+    assert res.headers["content-type"] == "application/zip"
+    assert res.headers["X-Bulk-Succeeded"] == "3"
+    assert res.headers["X-Bulk-Failed"] == "0"
+
+    archive = zipfile.ZipFile(io.BytesIO(res.content))
+    names = archive.namelist()
+    assert "_report.txt" in names
+    assert len([n for n in names if n.endswith(".txt") and n != "_report.txt"]) == 3
+    assert archive.read("01_dQw4w9WgXcQ.txt").decode() == "hello there\ngeneral kenobi"
+
+
+def test_bulk_combined_returns_one_text_file(client):
+    res = client.post("/api/bulk", json={"urls": THREE_IDS, "output": "combined"})
+    assert res.status_code == 200
+    assert "transcripts.txt" in res.headers["content-disposition"]
+    assert res.text.count("general kenobi") == 3
+
+
+def test_bulk_accepts_one_newline_separated_blob(client):
+    res = client.post("/api/bulk", json={"urls": ["\n".join(THREE_IDS)]})
+    assert res.status_code == 200
+    assert res.headers["X-Bulk-Total"] == "3"
+
+
+def test_bulk_dedupes_repeated_links(client):
+    res = client.post("/api/bulk", json={"urls": THREE_IDS + THREE_IDS})
+    assert res.status_code == 200
+    assert res.headers["X-Bulk-Total"] == "3"
+    assert client.fake.fetch_calls == 3
+
+
+def test_bulk_survives_one_bad_link(client):
+    res = client.post("/api/bulk", json={"urls": ["dQw4w9WgXcQ", "not-a-link"]})
+    assert res.status_code == 200
+    assert res.headers["X-Bulk-Succeeded"] == "1"
+    assert res.headers["X-Bulk-Failed"] == "1"
+
+    report = zipfile.ZipFile(io.BytesIO(res.content)).read("_report.txt").decode()
+    assert "not-a-link" in report
+    assert "FAILURES" in report
+
+
+def test_bulk_rejects_empty_and_oversized(client):
+    assert client.post("/api/bulk", json={"urls": []}).status_code == 400
+    too_many = [f"{i:011d}" for i in range(main.BULK_MAX_URLS + 1)]
+    assert client.post("/api/bulk", json={"urls": too_many}).status_code == 413
+
+
+def test_bulk_charges_rate_limit_per_video(client):
+    main.rate_limiter = main.RateLimiter(max_requests=5, window_seconds=60)
+    assert client.post("/api/bulk", json={"urls": THREE_IDS}).status_code == 200
+    # 3 spent, 2 left -- a second 3-video job must not fit.
+    blocked = client.post("/api/bulk", json={"urls": THREE_IDS})
+    assert blocked.status_code == 429
+
+
+def test_bulk_rejects_bad_format(client):
+    res = client.post("/api/bulk", json={"urls": THREE_IDS, "fmt": "docx"})
+    assert res.status_code == 422
+
+
 def test_captions_disabled_returns_404(client, monkeypatch):
     from youtube_transcript_api import TranscriptsDisabled
 

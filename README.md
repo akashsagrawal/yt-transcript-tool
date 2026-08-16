@@ -11,6 +11,7 @@ page.
   uploaded) and streams it back as a downloadable file.
 - `GET /api/languages?url=<...>` lists which caption languages exist for a
   video, if you want to add a language picker later.
+- `POST /api/bulk` takes many links at once — see below.
 - `GET /api/health` reports whether the proxy is configured, what the rate
   limit is, and how the cache is doing. Useful for checking a deploy.
 - If a video has no captions at all, there's nothing to pull — this tool can't
@@ -70,6 +71,39 @@ URLs like `http://user:pass@host:port` instead, and the app uses those.
 With no proxy variables set, the app still runs and works fine locally — it
 just talks to YouTube directly and will get blocked intermittently once it's on
 a cloud host.
+
+## Bulk mode
+
+The **Bulk** tab takes a list of links — one per line — and returns either a
+`.zip` with one file per video, or a single combined `.txt`. You can also drag
+a `.txt` file of links straight onto the box.
+
+```
+POST /api/bulk
+{"urls": ["https://youtu.be/xxx", "yyy"], "fmt": "txt", "output": "zip"}
+```
+
+Behaviour worth knowing:
+
+- **One bad link doesn't sink the job.** Failures are collected and listed in
+  `_report.txt` inside the zip (or at the top of the combined file); everything
+  that worked still comes back.
+- **Duplicates are dropped** before fetching, so the same video is never pulled
+  twice in one run.
+- **It costs rate-limit slots per video, not per request** — a 10-link job
+  spends 10 of your 20/minute. Otherwise bulk mode would be a hole straight
+  through the rate limit.
+- **Cached videos are free.** Anything pulled in the last 24 hours comes from
+  memory and never touches the proxy.
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `BULK_MAX_URLS` | `25` | Max links accepted in one request |
+| `BULK_CONCURRENCY` | `4` | How many are fetched in parallel |
+
+Don't raise `BULK_CONCURRENCY` much. Twenty simultaneous requests through the
+proxy is a good way to get flagged, and the gain is small since the slow part
+is YouTube, not you.
 
 ## Caching and rate limiting
 
